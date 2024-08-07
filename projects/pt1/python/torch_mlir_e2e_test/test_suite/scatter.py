@@ -1020,6 +1020,31 @@ def ScatterValueIntModule_basic(module, tu: TestUtils):
 # ==============================================================================
 
 
+class ScatterAddStaticModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+            ([10, 8, 6], torch.float32, True),
+            ([2, 4, 3], torch.int64, True),
+            ([5, 8, 6], torch.float32, True),
+        ]
+    )
+    def forward(self, input, index, src):
+        return torch.ops.aten.scatter_add(input, 0, index, src)
+
+
+@register_test_case(module_factory=lambda: ScatterAddStaticModule())
+def ScatterAddStaticModule_basic(module, tu: TestUtils):
+    module.forward(tu.rand(10, 8, 6), tu.randint(2, 4, 3, high=4), tu.rand(5, 8, 6))
+
+
+# ==============================================================================
+
+
 class ScatterReduceFloatModule(torch.nn.Module):
     include_self: bool
     reduce_type: str
@@ -1268,4 +1293,37 @@ def IndexPutImplIndexWithNoneModule_basic(module, tu: TestUtils):
         tu.randint(6, 1, high=4),
         tu.randint(7, high=5),
         tu.rand(2, 3, 6, 7),
+    )
+
+
+# ==============================================================================
+
+
+class IndexPutWithNoneAndBroadcastModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+            ([2, 3, 4, 5], torch.float32, True),
+            ([6, 1], torch.int64, True),
+            ([7], torch.int64, True),
+            ([1, 6, 7], torch.float32, True),
+        ]
+    )
+    def forward(self, input, index1, index2, value):
+        return torch.ops.aten.index_put(
+            input, (None, None, index1, index2), value, accumulate=True
+        )
+
+
+@register_test_case(module_factory=lambda: IndexPutWithNoneAndBroadcastModule())
+def IndexPutWithNoneAndBroadcastModule_basic(module, tu: TestUtils):
+    module.forward(
+        tu.rand(2, 3, 4, 5),
+        tu.randint(6, 1, high=4),
+        tu.randint(7, high=5),
+        tu.rand(1, 6, 7),  # broadcasted to (2, 3, 6, 7)
     )

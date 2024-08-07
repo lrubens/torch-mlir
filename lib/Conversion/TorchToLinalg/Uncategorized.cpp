@@ -15,6 +15,7 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Matchers.h"
 #include "torch-mlir/Conversion/TorchToLinalg/Utils.h"
 #include "torch-mlir/Conversion/Utils/Utils.h"
@@ -1441,7 +1442,7 @@ static Value createLinalgPayloadCalculationForElementwiseOp(
     scale = b.create<arith::TruncFOp>(loc, valueTy, scale);
 
     value = b.create<arith::DivFOp>(loc, value, scale);
-    value = b.create<math::RoundOp>(loc, value);
+    value = b.create<math::RoundEvenOp>(loc, value);
     value = b.create<arith::AddFOp>(loc, value, zp);
 
     auto destTy = payloadArgs[1].getType();
@@ -1460,12 +1461,8 @@ static Value createLinalgPayloadCalculationForElementwiseOp(
         b.create<arith::ConstantOp>(loc, b.getFloatAttr(valueTy, minI));
     Value maxVal =
         b.create<arith::ConstantOp>(loc, b.getFloatAttr(valueTy, maxI));
-    Value minCmp =
-        b.create<arith::CmpFOp>(loc, arith::CmpFPredicate::ULT, value, minVal);
-    Value maxCmp =
-        b.create<arith::CmpFOp>(loc, arith::CmpFPredicate::UGT, value, maxVal);
-    value = b.create<arith::SelectOp>(loc, minCmp, minVal, value);
-    value = b.create<arith::SelectOp>(loc, maxCmp, maxVal, value);
+    value = b.create<arith::MaximumFOp>(loc, value, minVal);
+    value = b.create<arith::MinimumFOp>(loc, value, maxVal);
 
     if (isUnsigned) {
       value = b.create<arith::FPToUIOp>(loc, destTy, value);
@@ -1648,7 +1645,27 @@ public:
 
     if (reduction == torch_upstream::Reduction::Sum ||
         reduction == torch_upstream::Reduction::Mean) {
-      Value numOfElems = getTensorSize(rewriter, loc, finalRes);
+
+      Value zeroIVal = rewriter.create<arith::ConstantOp>(
+          loc, rewriter.getZeroAttr(rewriter.getI32Type()));
+      auto countInfo = torch_to_linalg::ReductionOpInfo{false, target, dimSet};
+      Value numOfElems = torch_to_linalg::createReductionLinalgGeneric(
+          rewriter, loc, countInfo,
+          /*initElem=*/zeroIVal,
+          [&](OpBuilder &b, Location loc, ValueRange args) {
+            Value targetVal = args[0];
+            Value indTarget = rewriter.create<arith::IndexCastOp>(
+                loc, rewriter.getIndexType(), targetVal);
+            Value cmpEq = rewriter.create<arith::CmpIOp>(
+                loc, arith::CmpIPredicate::ne, indTarget, ignoreIndexVal);
+            cmpEq = rewriter.create<arith::ExtUIOp>(loc, rewriter.getI32Type(),
+                                                    cmpEq);
+            Value add = rewriter.create<arith::AddIOp>(loc, args[1], cmpEq);
+            rewriter.create<linalg::YieldOp>(loc, add);
+          });
+
+      numOfElems = rewriter.create<tensor::ExtractOp>(
+          loc, rewriter.getI32Type(), numOfElems, ArrayRef<Value>{});
       numOfElems = convertScalarToDtype(rewriter, loc, numOfElems, elementType);
 
       auto opInfo = torch_to_linalg::ReductionOpInfo{false, finalRes, dimSet};
@@ -2696,8 +2713,6 @@ static Value BilinearInterpolate(OpBuilder &b,
   auto inputType = cast<RankedTensorType>(input.getType());
   auto inputRank = inputType.getRank();
 
-  Value cstOneEps =
-      b.create<arith::ConstantOp>(loc, b.getF32FloatAttr(1.000001));
   Value cstOneFloat = b.create<arith::ConstantOp>(loc, b.getF32FloatAttr(1.0));
   Value cstHalf = b.create<arith::ConstantOp>(loc, b.getF32FloatAttr(0.5));
   Value zero = b.create<arith::ConstantOp>(loc, b.getF32FloatAttr(0.0));
@@ -2773,28 +2788,34 @@ static Value BilinearInterpolate(OpBuilder &b,
                                           outputSizeFP, cstOneFloat);
       preClip = b.create<arith::SelectOp>(loc, cmp, zero, preClip);
     }
-    // clip to 0,inf
+    // preClip is the fp position inside the input image to extract from.
+    // clip to [0,inf)
     Value max = b.create<arith::MaximumFOp>(loc, preClip, zero);
-    // length_original - 1.001
-    Value inputSubOneEps = b.create<arith::SubFOp>(loc, inputFP, cstOneEps);
     Value inputSubOne = b.create<arith::SubFOp>(loc, inputFP, cstOneFloat);
-    // clip to [0,length_original - 1.001]
-    projEps.push_back(b.create<arith::MinimumFOp>(loc, max, inputSubOneEps));
+    // clip to [0,length_original - 1].
+    // proj is properly within the input image.
     proj.push_back(b.create<arith::MinimumFOp>(loc, max, inputSubOne));
 
-    lowFP.push_back(b.create<math::FloorOp>(loc, projEps[i]));
-    Value projPlusOne = b.create<arith::AddFOp>(loc, cstOneFloat, projEps[i]);
+    // for bilinear interpolation, we look for the nearest indices below and
+    // above proj
+    lowFP.push_back(b.create<math::FloorOp>(loc, proj[i]));
+    Value projPlusOne = b.create<arith::AddFOp>(loc, cstOneFloat, proj[i]);
     highFP.push_back(b.create<math::FloorOp>(loc, projPlusOne));
 
     Value lowInt = b.create<arith::FPToSIOp>(loc, b.getI64Type(), lowFP[i]);
     low.push_back(b.create<arith::IndexCastOp>(loc, b.getIndexType(), lowInt));
 
-    Value highInt = b.create<arith::FPToSIOp>(loc, b.getI64Type(), highFP[i]);
+    // highFP could be out-of-bounds, so make sure to clip it down before
+    // extracting. If highFP actually gets clipped here, then high[i] will
+    // extract at the last pixel, but will treat it as if it were extracted from
+    // one further position when computing the interpolation weights.
+    Value highExtract =
+        b.create<arith::MinimumFOp>(loc, projPlusOne, inputSubOne);
+    highExtract = b.create<arith::FPToSIOp>(loc, b.getI64Type(), highExtract);
     high.push_back(
-        b.create<arith::IndexCastOp>(loc, b.getIndexType(), highInt));
+        b.create<arith::IndexCastOp>(loc, b.getIndexType(), highExtract));
   }
 
-  SmallVector<Value> cornerValues;
   indices[dimOffset] = low[0];
   indices[dimOffset + 1] = low[1];
   Value p00 = b.create<tensor::ExtractOp>(loc, input, indices);
@@ -2952,6 +2973,218 @@ public:
   }
 };
 } // namespace
+
+namespace {
+// This pattern row reduces a matrix, then returns the product of it's diagonal
+// elements
+class ConvertAtenLinalgDetOp : public OpConversionPattern<AtenLinalgDetOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(AtenLinalgDetOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op->getLoc();
+    MLIRContext *context = op->getContext();
+    Value input = adaptor.getA();
+    auto inputType = cast<RankedTensorType>(input.getType());
+    unsigned inputRank = inputType.getRank();
+    auto elemTy = inputType.getElementType();
+    bool isBatched = (inputRank == 3);
+    Value cstZero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    Value cstOne = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    Value cstZeroF = getConstant(rewriter, loc, 0, elemTy);
+    // get some shapes
+    SmallVector<int64_t> inputShape(inputType.getShape());
+    SmallVector<int64_t> sliceShape(inputShape);
+    sliceShape.pop_back();
+    SmallVector<int64_t> diagShape({isBatched ? inputType.getShape()[0] : 1});
+    auto sliceTy = RankedTensorType::get(sliceShape, elemTy);
+    auto diagTy = RankedTensorType::get(diagShape, elemTy);
+    // get some sizes
+    SmallVector<Value> inputSizes = getTensorSizes(rewriter, loc, input);
+    Value chDim = isBatched ? inputSizes[0] : cstOne;
+    Value matDim = inputSizes[inputRank - 1];
+    Value matDimMinusOne = rewriter.create<arith::SubIOp>(loc, matDim, cstOne);
+    ArrayRef<Value> sliceSizes(inputSizes.begin(), inputSizes.end() - 1);
+    // initialize a tensor to store the diagonal elements found during row
+    // reduction
+    Value initDiags = rewriter.create<tensor::EmptyOp>(
+        loc, getAsOpFoldResult(sliceSizes), elemTy);
+    // loop over each pivot row in A. Get the diagonal, then reduce the
+    // subdiagonal Don't perform the loop on the last row since no further
+    // reduction is needed.
+    auto rowReductionLoop = rewriter.create<scf::ForOp>(
+        loc, /*start=*/cstZero, /*end=*/matDimMinusOne, /*step=*/cstOne,
+        /*yeild_to=*/ValueRange{input, initDiags}, /*body_lambda=*/
+        [&](OpBuilder &b, Location loc, Value row, ValueRange vals) {
+          // extract row i from input Tensor of shape CxNxN or shape
+          // NxN.
+          OpFoldResult cstOneFold = getAsOpFoldResult(cstOne);
+          OpFoldResult cstZeroFold = getAsOpFoldResult(cstZero);
+          SmallVector<OpFoldResult> offsets(inputRank, cstZeroFold);
+          offsets[inputRank - 2] = row;
+          SmallVector<OpFoldResult> strides(inputRank, cstOneFold);
+          auto sizes = getAsOpFoldResult(inputSizes);
+          sizes[inputRank - 2] = cstOneFold;
+          // offsets = [0, row, 0], sizes = [C, 1, N] -> pivot row
+          Value pivot = b.create<tensor::ExtractSliceOp>(
+              loc, sliceTy, vals[0], offsets, sizes, strides);
+          // extract diagonal elements and insert them into vals[1]
+          offsets.back() = row;
+          sizes.back() = cstOneFold;
+          // offsets = [0, row, row], sizes = [C, 1, 1] -> diag(row,row)
+          Value diag = b.create<tensor::ExtractSliceOp>(
+              loc, diagTy, vals[0], offsets, sizes, strides);
+          SmallVector<OpFoldResult> diagOffsets(inputRank - 1, cstZeroFold);
+          diagOffsets.back() = row;
+          SmallVector<OpFoldResult> diagStrides(inputRank - 1, cstOneFold);
+          SmallVector<OpFoldResult> diagSizes = getAsOpFoldResult(sliceSizes);
+          diagSizes.back() = cstOneFold;
+          // offsets = [0, row], sizes = [C, 1] insert to [C,N]
+          Value updatedDiags = b.create<tensor::InsertSliceOp>(
+              loc, diag, vals[1], diagOffsets, diagSizes, diagStrides);
+          // the subpivot matrix column size, as a Value, is matDim - row -
+          // cstOne. This can't be statically converted to an int64_t, since row
+          // is the loop index, so this is left as a dynamic dim.
+          SmallVector<int64_t> subPivotShape(inputType.getShape());
+          subPivotShape[inputRank - 2] = ShapedType::kDynamic;
+          ArrayRef<int64_t> subDiagShape(subPivotShape.begin(),
+                                         subPivotShape.end() - 1);
+          auto subPivotTy = RankedTensorType::get(subPivotShape, elemTy);
+          auto subDiagTy = RankedTensorType::get(subDiagShape, elemTy);
+          Value rowPlusOne = b.create<arith::AddIOp>(loc, row, cstOne);
+          offsets[inputRank - 2] = getAsOpFoldResult(rowPlusOne);
+          sizes[inputRank - 2] = getAsOpFoldResult(
+              b.create<arith::SubIOp>(loc, matDim, rowPlusOne));
+          // offsets = [0, row + 1, row], sizes = [C, N - row - 1, 1] -> A_j,row
+          // with j > row
+          Value subDiag = b.create<tensor::ExtractSliceOp>(
+              loc, subDiagTy, vals[0], offsets, sizes, strides);
+          offsets.back() = cstZeroFold;
+          sizes.back() = getAsOpFoldResult(matDim);
+          // offsets = [0, row + 1, 0], sizes = [C, N - row - 1, N] -> elements
+          // below pivot row
+          Value subPivot = b.create<tensor::ExtractSliceOp>(
+              loc, subPivotTy, vals[0], offsets, sizes, strides);
+          Value initResult = b.create<tensor::EmptyOp>(loc, sizes, elemTy);
+          // write a generic op to perform subpivot = subpivot -
+          // (subdiag/diag)*pivot
+          // d0 = batches, d1 = row, d2 = column -> pivot(d0,d2), diag(d0),
+          // subPivot(d0,d1,d2), subDiag(d0, d1); output(d0,d1,d2)
+          SmallVector<AffineExpr> allDims;
+          for (unsigned i = 0; i < inputRank; i++)
+            allDims.push_back(b.getAffineDimExpr(i));
+          SmallVector<AffineExpr> rowIterator(1, allDims[0]);
+          SmallVector<AffineExpr> colIterator;
+          SmallVector<AffineExpr> batchIterator;
+          if (isBatched) {
+            rowIterator.push_back(allDims[1]);
+            colIterator.push_back(allDims[0]);
+            colIterator.push_back(allDims[2]);
+            batchIterator.push_back(allDims[0]);
+          } else {
+            colIterator.push_back(allDims[1]);
+            batchIterator.push_back(getAffineConstantExpr(0, context));
+          }
+          SmallVector<AffineMap> indexingMaps;
+          indexingMaps.push_back(
+              AffineMap::get(inputRank, 0, colIterator, context));
+          indexingMaps.push_back(
+              AffineMap::get(inputRank, 0, batchIterator, context));
+          indexingMaps.push_back(b.getMultiDimIdentityMap(inputRank));
+          indexingMaps.push_back(
+              AffineMap::get(inputRank, 0, rowIterator, context));
+          indexingMaps.push_back(b.getMultiDimIdentityMap(inputRank));
+          SmallVector<utils::IteratorType> iteratorTypes(
+              inputRank, utils::IteratorType::parallel);
+          Value reducedSubPivot =
+              b.create<linalg::GenericOp>(
+                   loc, subPivotTy, ValueRange{pivot, diag, subPivot, subDiag},
+                   initResult, indexingMaps, iteratorTypes,
+                   [&](OpBuilder &b, Location loc, ValueRange args) {
+                     // for d0 in batches, d1 in subpivotrows, d2 in columns
+                     // let i represent the pivot row index (scf loop index)
+                     Value pivotd0d2 = args[0];
+                     Value diagd0 = args[1];
+                     Value subPivotd0d1d2 = args[2];
+                     Value subDiagd0d1 = args[3];
+                     // coeff = A_d1,i / A_i,i
+                     Value coeff =
+                         b.create<arith::DivFOp>(loc, subDiagd0d1, diagd0);
+                     auto cmp = b.create<arith::CmpFOp>(
+                         loc, arith::CmpFPredicate::ONE, diagd0, cstZeroF);
+                     b.create<cf::AssertOp>(
+                         loc, cmp,
+                         b.getStringAttr(
+                             "unimplemented: determinants requiring "
+                             "permutations and singular matrices"));
+                     // coeff*A_i,d2
+                     Value scaledPivotValue =
+                         b.create<arith::MulFOp>(loc, coeff, pivotd0d2);
+                     // result = A_d1,d2 - (A_d1,i/A_i,i)*A_i,d2
+                     // so that when d2 = i, A_d1,i - (A_d1,i/A_i,i) * A_i,i = 0
+                     Value result = b.create<arith::SubFOp>(loc, subPivotd0d1d2,
+                                                            scaledPivotValue);
+                     b.create<linalg::YieldOp>(loc, result);
+                   })
+                  .getResult(0);
+          Value rowReductionResult = b.create<tensor::InsertSliceOp>(
+              loc, reducedSubPivot, vals[0], offsets, sizes, strides);
+          b.create<scf::YieldOp>(loc,
+                                 ValueRange{rowReductionResult, updatedDiags});
+        });
+    Value allDiagsExceptLast = rowReductionLoop.getResult(1);
+    SmallVector<OpFoldResult> offsets(inputRank,
+                                      getAsOpFoldResult(matDimMinusOne));
+    SmallVector<OpFoldResult> strides(inputRank, getAsOpFoldResult(cstOne));
+    SmallVector<OpFoldResult> sizes(inputRank, getAsOpFoldResult(cstOne));
+    sizes[0] = getAsOpFoldResult(chDim);
+    if (isBatched)
+      offsets[0] = getAsOpFoldResult(cstZero);
+    Value lastDiag = rewriter.create<tensor::ExtractSliceOp>(
+        loc, diagTy, rowReductionLoop.getResult(0), offsets, sizes, strides);
+    offsets.pop_back();
+    strides.pop_back();
+    sizes.pop_back();
+    Value allDiags = rewriter.create<tensor::InsertSliceOp>(
+        loc, lastDiag, allDiagsExceptLast, offsets, sizes, strides);
+    // linalg generic to do reduce prod for allDiags along back dim.
+    // the result of that generic will be the determinant
+    SmallVector<AffineMap> indexingMaps;
+    indexingMaps.push_back(rewriter.getMultiDimIdentityMap(inputRank - 1));
+    AffineExpr resultExpr = isBatched ? rewriter.getAffineDimExpr(0)
+                                      : getAffineConstantExpr(0, context);
+    indexingMaps.push_back(AffineMap::get(inputRank - 1, 0, resultExpr));
+    SmallVector<utils::IteratorType> iteratorTypes(
+        inputRank - 1, utils::IteratorType::parallel);
+    Value initDet = createInitTensor(rewriter, loc, ValueRange{chDim}, elemTy,
+                                     getConstant(rewriter, loc, 1.0, elemTy));
+    Value determinant =
+        rewriter
+            .create<linalg::GenericOp>(
+                loc, initDet.getType(), ValueRange{allDiags}, initDet,
+                indexingMaps, iteratorTypes,
+                [&](OpBuilder &b, Location loc, ValueRange args) {
+                  Value prod = b.create<arith::MulFOp>(loc, args[0], args[1]);
+                  b.create<linalg::YieldOp>(loc, prod);
+                })
+            .getResult(0);
+    Type newResultType =
+        getTypeConverter()->convertType(op.getResult().getType());
+    if (isBatched) {
+      rewriter.replaceOpWithNewOp<tensor::CastOp>(op, newResultType,
+                                                  determinant);
+      return success();
+    }
+    Value detVal = rewriter.create<tensor::ExtractOp>(
+        loc, determinant, SmallVector<Value>(1, cstZero));
+    rewriter.replaceOpWithNewOp<tensor::FromElementsOp>(op, newResultType,
+                                                        ValueRange{detVal});
+    return success();
+  }
+};
+} // namespace
+
 void mlir::torch::torch_to_linalg::populateUncategorizedPatternsAndLegality(
     TypeConverter &typeConverter, RewritePatternSet &patterns,
     ConversionTarget &target) {
@@ -3009,4 +3242,6 @@ void mlir::torch::torch_to_linalg::populateUncategorizedPatternsAndLegality(
   patterns.add<ConvertAtenGridSamplerOp>(typeConverter, context);
   target.addIllegalOp<Aten__InterpolateSizeListScaleListOp>();
   patterns.add<ConvertInterpolateOp>(typeConverter, context);
+  target.addIllegalOp<AtenLinalgDetOp>();
+  patterns.add<ConvertAtenLinalgDetOp>(typeConverter, context);
 }

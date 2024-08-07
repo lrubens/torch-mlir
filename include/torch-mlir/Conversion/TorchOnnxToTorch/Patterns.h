@@ -209,6 +209,16 @@ struct OpBinder {
     return success();
   }
 
+  ParseResult tensorOperandTypes(llvm::SmallVector<mlir::Type> &typeList) {
+    for (auto operand : op->getOperands()) {
+      auto t = toValidTensorType(operand.getType());
+      if (!t)
+        return failure();
+      typeList.push_back(t);
+    }
+    return success();
+  }
+
   // The importer imports Onnx.GraphProto attributes as regions attached to the
   // op.
   ParseResult getRegionAtIndex(mlir::Region *&region, int64_t idx) {
@@ -272,6 +282,16 @@ struct OpBinder {
       return success();
     }
     return failure();
+  }
+
+  ParseResult optionalS64IntegerAttr(int64_t &value, StringRef nameSuffix) {
+    SmallString<64> name("torch.onnx.");
+    name.append(nameSuffix);
+    auto attr = op->getAttr(name);
+    if (!attr) {
+      return failure();
+    }
+    return s64IntegerAttr(value, nameSuffix);
   }
 
   ParseResult f32FloatAttr(float &value, StringRef nameSuffix,

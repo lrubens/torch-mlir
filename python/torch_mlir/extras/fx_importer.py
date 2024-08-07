@@ -151,11 +151,17 @@ TORCH_DTYPE_TO_MLIR_TYPE_ASM = {
     torch.complex32: "complex<f16>",
     torch.complex64: "complex<f32>",
     torch.complex128: "complex<f64>",
-    torch.float8_e5m2: "f8E5M2",
-    torch.float8_e4m3fn: "f8E4M3FN",
-    torch.float8_e5m2fnuz: "f8E5M2FNUZ",
-    torch.float8_e4m3fnuz: "f8E4M3FNUZ",
 }
+# Type entries added only in torch with higher version
+OPTIONAL_TORCH_DTYPE_TO_MLIR_TYPE_ASM = {
+    "float8_e5m2": "f8E5M2",
+    "float8_e4m3fn": "f8E4M3FN",
+    "float8_e5m2fnuz": "f8E5M2FNUZ",
+    "float8_e4m3fnuz": "f8E4M3FNUZ",
+}
+for dtype_str, dtype_asm in OPTIONAL_TORCH_DTYPE_TO_MLIR_TYPE_ASM.items():
+    if hasattr(torch, dtype_str):
+        TORCH_DTYPE_TO_MLIR_TYPE_ASM[getattr(torch, dtype_str)] = dtype_asm
 
 TORCH_DTYPE_TO_MLIR_TYPE: Dict[torch.dtype, Callable[[], IrType]] = {
     torch.float16: lambda: F16Type.get(),
@@ -173,11 +179,17 @@ TORCH_DTYPE_TO_MLIR_TYPE: Dict[torch.dtype, Callable[[], IrType]] = {
     torch.complex32: lambda: ComplexType.get(F16Type.get()),
     torch.complex64: lambda: ComplexType.get(F32Type.get()),
     torch.complex128: lambda: ComplexType.get(F64Type.get()),
-    torch.float8_e5m2: lambda: Float8E5M2Type.get(),
-    torch.float8_e5m2fnuz: lambda: Float8E5M2FNUZType.get(),
-    torch.float8_e4m3fn: lambda: Float8E4M3FNType.get(),
-    torch.float8_e4m3fnuz: lambda: Float8E4M3FNUZType.get(),
 }
+# Type entries added only in torch with higher version
+OPTIONAL_TORCH_DTYPE_TO_MLIR_TYPE = {
+    "float8_e5m2": lambda: Float8E5M2Type.get(),
+    "float8_e4m3fn": lambda: Float8E4M3FNType.get(),
+    "float8_e5m2fnuz": lambda: Float8E5M2FNUZType.get(),
+    "float8_e4m3fnuz": lambda: Float8E4M3FNUZType.get(),
+}
+for dtype_str, mlir_type in OPTIONAL_TORCH_DTYPE_TO_MLIR_TYPE.items():
+    if hasattr(torch, dtype_str):
+        TORCH_DTYPE_TO_MLIR_TYPE[getattr(torch, dtype_str)] = mlir_type
 
 TORCH_DTYPE_TO_NPY_TYPE = {
     # torch.qint8: None, # no equivalent np datatype
@@ -215,11 +227,17 @@ TORCH_DTYPE_TO_INT = {
     # torch.quint8: 13,
     # torch.qint32 14
     torch.bfloat16: 15,
-    torch.float8_e5m2: 23,
-    torch.float8_e4m3fn: 24,
-    torch.float8_e5m2fnuz: 25,
-    torch.float8_e4m3fnuz: 26,
 }
+# Type entries added only in torch with higher version
+OPTIONAL_TORCH_DTYPE_TO_INT = {
+    "float8_e5m2": 23,
+    "float8_e4m3fn": 24,
+    "float8_e5m2fnuz": 25,
+    "float8_e4m3fnuz": 26,
+}
+for dtype_str, dtype_int in OPTIONAL_TORCH_DTYPE_TO_INT.items():
+    if hasattr(torch, dtype_str):
+        TORCH_DTYPE_TO_INT[getattr(torch, dtype_str)] = dtype_int
 
 TORCH_MEMORY_FORMAT_TO_INT = {
     torch.contiguous_format: 0,
@@ -247,6 +265,8 @@ PY_BUILTIN_TO_TORCH_OP = {
     "ge": torch.ops.aten.ge,
     "ne": torch.ops.aten.ne,
     "gt": torch.ops.aten.gt,
+    "mod": torch.ops.aten.fmod,
+    "eq": torch.ops.aten.eq,
 }
 
 # torch with cuda has a __version__ that looks like  "2.1.0+cu113",
@@ -1063,6 +1083,11 @@ class ContextCache:
         mutable: bool = False,
     ):
         if tensor_meta is not None:
+            # separately handle when tensor_meta is a list.
+            if isinstance(val, list) and all(
+                isinstance(x, TorchFakeTensor) for x in val
+            ):
+                return IrType.parse("!torch.list<vtensor>", context=self._c)
             assert isinstance(tensor_meta, TensorMetadata)
             # Quantized tensor meta data is not preserved in our lowering,
             # so throw error instead of silently doing wrong thing.
@@ -1081,6 +1106,10 @@ class ContextCache:
                 return self.get_vtensor_type(
                     val.size(), val.dtype, sparsity=sparsity, mutable=mutable
                 )
+            elif isinstance(val, list) and all(
+                isinstance(x, TorchFakeTensor) for x in val
+            ):
+                return IrType.parse("!torch.list<vtensor>", context=self._c)
 
         # Note that None is a valid scalar here, so it is important that this
         # is always checked as the last fallback.
@@ -1209,6 +1238,7 @@ class GraphNodeImporter:
         "_v",
         "_symbol_to_value",
         "_multi_result_nodes",
+        "_unpack_list_values",
         "fx_importer",
     ]
 
@@ -1233,6 +1263,10 @@ class GraphNodeImporter:
         # Statically multi-result nodes which we have de-tupled are noted here.
         # They will have their getitem calls short-circuited.
         self._multi_result_nodes: Set[torch_fx.Node] = set()
+        # If a OP returns a list, then it needs to be unpacked entirely using
+        # prim.ListUnpack.  Cache the result of these nodes so that it only
+        # unpacks once instead of every time that getitem is used
+        self._unpack_list_values: Dict[torch_fx.Node, Tuple[Value]] = {}
 
     def bind_node_value(
         self,
@@ -1402,29 +1436,7 @@ class GraphNodeImporter:
                 elif op == "call_function":
                     target = node.target
                     if target == operator.getitem:
-                        # Special case handling of getitem for when it is resolving
-                        # against a function call that we know has returned multiple
-                        # results. We short-circuit this case because we have modeled
-                        # function calls to natively return multiple results vs tupling.
-                        getitem_ref, getitem_index = node.args
-                        if getitem_ref in self._multi_result_nodes:
-                            try:
-                                self.bind_node_value(
-                                    node,
-                                    self.resolve_node_value(getitem_ref, getitem_index),
-                                )
-                            except IndexError:
-                                raise RuntimeError(
-                                    f"getitem de-aliasing failed. This likely "
-                                    f"indicates a programmer error that usually "
-                                    f"would have happened at runtime. Please "
-                                    f"notify developers if this case happens "
-                                    f"(at {loc})."
-                                )
-                        else:
-                            raise NotImplementedError(
-                                f"General getitem access to non-multi-result ops"
-                            )
+                        self._import_getitem(loc, node)
                     elif target in SYMBOLIC_TORCH_OPS or (
                         is_symbolic(node.meta.get("val"))
                         and is_builtin_function_or_method(target)
@@ -1989,6 +2001,51 @@ class GraphNodeImporter:
         with loc:
             return cvt(arg, self, self._cc)
 
+    def _import_getitem(self, loc: Location, node: torch.fx.Node):
+        ref_node, index = node.args
+        if ref_node in self._multi_result_nodes:
+            # Special case handling of getitem for when it is resolving
+            # against a function call that we know has returned multiple
+            # results. We short-circuit this case because we have modeled
+            # function calls to natively return multiple results vs tupling.
+            try:
+                self.bind_node_value(
+                    node,
+                    self.resolve_node_value(ref_node, index),
+                )
+            except IndexError:
+                raise RuntimeError(
+                    f"getitem de-aliasing failed. This likely "
+                    f"indicates a programmer error that usually "
+                    f"would have happened at runtime. Please "
+                    f"notify developers if this case happens "
+                    f"(at {loc})."
+                )
+        else:
+            # handle nodes that return a torch.list<...> at the MLIR level
+            # NOTE: the length of the list must be knowable at compile time.
+            if ref_node not in self._unpack_list_values:
+                node_result = self.resolve_node_value(ref_node, 0)
+                if str(node_result.type) in TORCH_LIST_TYPES:
+                    result_types = [
+                        self._cc.value_info_to_type(v) for v in ref_node.meta["val"]
+                    ]
+                    operation = Operation.create(
+                        "torch.prim.ListUnpack",
+                        results=result_types,
+                        operands=[node_result],
+                        loc=loc,
+                    )
+                    self._unpack_list_values[ref_node] = tuple(operation.results)
+
+            try:
+                self.bind_node_value(node, self._unpack_list_values[ref_node][index])
+            except IndexError:
+                raise RuntimeError(
+                    f"getitem failed. "
+                    f"getitem only supports lists of known length. (at {loc})"
+                )
+
     def _unpack_node_result_types(
         self, node: torch.fx.Node, schema: FunctionSchema
     ) -> List[IrType]:
@@ -2318,6 +2375,10 @@ PY_TYPE_TO_TORCH_OPTIONAL_LIST_TYPE = {
     "tensor": "!torch.list<optional<tensor>>",
     "vtensor": "!torch.list<optional<vtensor>>",
 }
+
+TORCH_LIST_TYPES = set(PY_TYPE_TO_TORCH_LIST_TYPE.values()) | set(
+    PY_TYPE_TO_TORCH_OPTIONAL_LIST_TYPE.values()
+)
 
 SCALAR_TYPE_TO_TORCH_MLIR_TYPE = {
     torch.SymInt: "!torch.int",

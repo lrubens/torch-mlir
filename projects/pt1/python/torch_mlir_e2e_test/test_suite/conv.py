@@ -1156,21 +1156,12 @@ def ConvTbcModule_basic(module, tu: TestUtils):
     module.forward(tu.rand(9, 4, 5), tu.rand(3, 5, 6), tu.rand(6))
 
 
-class Conv2dQInt8Module(torch.nn.Module):
+class Conv2dQInt8ModuleBase(torch.nn.Module):
     def __init__(self, groups=1):
         self.groups = groups
         super().__init__()
 
-    @export
-    @annotate_args(
-        [
-            None,
-            ([-1, -1, -1, -1], torch.int8, True),
-            ([-1, -1, -1, -1], torch.int8, True),
-            ([-1], torch.float, True),
-        ]
-    )
-    def forward(self, inputVec, weight, bias):
+    def _forward(self, inputVec, weight, bias):
         inputVec = torch._make_per_tensor_quantized_tensor(inputVec, 0.01, 7)
         inputVec = torch.dequantize(inputVec)
 
@@ -1191,7 +1182,49 @@ class Conv2dQInt8Module(torch.nn.Module):
         )
 
 
-@register_test_case(module_factory=lambda: Conv2dQInt8Module())
+class Conv2dQInt8ModuleDyn(Conv2dQInt8ModuleBase):
+    @export
+    @annotate_args(
+        [
+            None,
+            ([-1, -1, -1, -1], torch.int8, True),
+            ([-1, -1, -1, -1], torch.int8, True),
+            ([-1], torch.float, True),
+        ]
+    )
+    def forward(self, inputVec, weight, bias):
+        return self._forward(inputVec, weight, bias)
+
+
+class Conv2dQInt8ModuleStatic(Conv2dQInt8ModuleBase):
+    @export
+    @annotate_args(
+        [
+            None,
+            ([2, 3, 12, 12], torch.int8, True),
+            ([3, 1, 5, 3], torch.int8, True),
+            ([3], torch.float, True),
+        ]
+    )
+    def forward(self, inputVec, weight, bias):
+        return self._forward(inputVec, weight, bias)
+
+
+class Conv2dQInt8ModuleStatic_MoreOutChannels(Conv2dQInt8ModuleBase):
+    @export
+    @annotate_args(
+        [
+            None,
+            ([2, 3, 12, 12], torch.int8, True),
+            ([6, 1, 5, 3], torch.int8, True),
+            ([6], torch.float, True),
+        ]
+    )
+    def forward(self, inputVec, weight, bias):
+        return self._forward(inputVec, weight, bias)
+
+
+@register_test_case(module_factory=lambda: Conv2dQInt8ModuleDyn())
 def Conv2dQInt8Module_basic(module, tu: TestUtils):
     inputVec = tu.randint(2, 4, 7, 8, low=-128, high=127).to(torch.int8)
     weight = tu.randint(3, 4, 3, 2, low=-128, high=127).to(torch.int8)
@@ -1199,10 +1232,28 @@ def Conv2dQInt8Module_basic(module, tu: TestUtils):
     module.forward(inputVec, weight, bias)
 
 
-@register_test_case(module_factory=lambda: Conv2dQInt8Module(groups=2))
+@register_test_case(module_factory=lambda: Conv2dQInt8ModuleDyn(groups=2))
 def Conv2dQInt8Module_grouped(module, tu: TestUtils):
     inputVec = tu.randint(2, 8, 7, 8, low=-128, high=127).to(torch.int8)
     weight = tu.randint(6, 4, 3, 2, low=-128, high=127).to(torch.int8)
+    bias = torch.rand(6)
+    module.forward(inputVec, weight, bias)
+
+
+@register_test_case(module_factory=lambda: Conv2dQInt8ModuleStatic(groups=3))
+def Conv2dQInt8Module_depthwise(module, tu: TestUtils):
+    inputVec = tu.randint(2, 3, 12, 12, low=-128, high=127).to(torch.int8)
+    weight = tu.randint(3, 1, 5, 3, low=-128, high=127).to(torch.int8)
+    bias = torch.rand(3)
+    module.forward(inputVec, weight, bias)
+
+
+@register_test_case(
+    module_factory=lambda: Conv2dQInt8ModuleStatic_MoreOutChannels(groups=3)
+)
+def Conv2dQInt8Module_not_depthwise(module, tu: TestUtils):
+    inputVec = tu.randint(2, 3, 12, 12, low=-128, high=127).to(torch.int8)
+    weight = tu.randint(6, 1, 5, 3, low=-128, high=127).to(torch.int8)
     bias = torch.rand(6)
     module.forward(inputVec, weight, bias)
 
@@ -1256,3 +1307,90 @@ def ConvTranspose2DQInt8_basic(module, tu: TestUtils):
         tu.randint(Cin, Cout, Hker, Wker, low=-128, high=127).to(torch.int8),
         torch.rand(Cout),
     )
+
+
+# torchvision.deform_conv2d
+
+import torchvision
+
+# This section defines a torch->onnx path for this torchvision op so we can test the onnx paths e2e.
+
+# Create symbolic function
+from torch.onnx.symbolic_helper import parse_args, _get_tensor_sizes
+
+
+@parse_args("v", "v", "v", "v", "v", "i", "i", "i", "i", "i", "i", "i", "i", "b")
+def symbolic_deform_conv2d_forward(
+    g,
+    input,
+    weight,
+    offset,
+    mask,
+    bias,
+    stride_h,
+    stride_w,
+    pad_h,
+    pad_w,
+    dilation_h,
+    dilation_w,
+    groups,
+    offset_groups,
+    use_mask,
+):
+    args = [input, weight, offset, bias]
+    if use_mask:
+        args.append(mask)
+    weight_size = _get_tensor_sizes(weight)
+    kwargs = {
+        "dilations_i": [dilation_h, dilation_w],
+        "group_i": groups,
+        "kernel_shape_i": weight_size[2:],
+        "offset_group_i": offset_groups,
+        # NB: ONNX supports asymmetric padding, whereas PyTorch supports only
+        # symmetric padding
+        "pads_i": [pad_h, pad_w, pad_h, pad_w],
+        "strides_i": [stride_h, stride_w],
+    }
+    return g.op("DeformConv", *args, **kwargs)
+
+
+# Register symbolic function
+from torch.onnx import register_custom_op_symbolic
+
+register_custom_op_symbolic(
+    "torchvision::deform_conv2d", symbolic_deform_conv2d_forward, 19
+)
+
+N = 1
+Cin = 1
+Hin = 7
+Win = 6
+Cout = 1
+Hker = 2
+Wker = 2
+offset_groups = 1
+Hout = 6
+Wout = 5
+offset_dim1 = 2 * offset_groups * Hker * Wker
+
+
+class DeformableConvModule(torch.nn.Module):
+    @export
+    @annotate_args(
+        [
+            None,
+            ([N, Cin, Hin, Win], torch.float32, True),
+            ([N, offset_dim1, Hout, Wout], torch.float32, True),
+            ([Cout, Cin, Hker, Wker], torch.float32, True),
+        ]
+    )
+    def forward(self, input, offset, weight):
+        return torchvision.ops.deform_conv2d(input, offset, weight)
+
+
+@register_test_case(module_factory=lambda: DeformableConvModule())
+def DeformConv2D_basic(module, tu: TestUtils):
+    input = tu.rand(N, Cin, Hin, Win)
+    offset = tu.rand(N, offset_dim1, Hout, Wout)
+    weight = tu.rand(Cout, Cin, Hker, Wker)
+    module.forward(input, offset, weight)

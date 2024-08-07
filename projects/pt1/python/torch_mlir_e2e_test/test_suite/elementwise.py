@@ -610,6 +610,29 @@ def ElementwiseWhereScalarSelfStaticModule_basic(module, tu: TestUtils):
 # ==============================================================================
 
 
+class ElementwiseNanToNumWithNoneModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args([None, ([3, 4], torch.float32, True)])
+    def forward(self, a):
+        return torch.ops.aten.nan_to_num(a)
+
+
+@register_test_case(module_factory=lambda: ElementwiseNanToNumWithNoneModule())
+def ElementwiseNanToNumWithNoneModule_Basic(module, tu: TestUtils):
+    module.forward(
+        torch.tensor(
+            [
+                [float("nan"), 0.0, float("nan"), 1.0],
+                [float("inf"), 2.0, float("inf"), 3.0],
+                [float("-inf"), -1.0, float("-inf"), 4.0],
+            ]
+        )
+    )
+
+
 class ElementwiseNanToNumModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -617,7 +640,7 @@ class ElementwiseNanToNumModule(torch.nn.Module):
     @export
     @annotate_args([None, ([3, 4], torch.float32, True)])
     def forward(self, a):
-        return torch.ops.aten.nan_to_num(a, 0.0, 1.0, -1.0)
+        return torch.ops.aten.nan_to_num(a, 0.1, 1.0, -1.0)
 
 
 @register_test_case(module_factory=lambda: ElementwiseNanToNumModule())
@@ -625,9 +648,9 @@ def ElementwiseNanToNumModule_Basic(module, tu: TestUtils):
     module.forward(
         torch.tensor(
             [
-                [float("nan"), 0.0, float("nan"), 0.0],
-                [float("inf"), 0.0, float("inf"), 0.0],
-                [float("-inf"), 0.0, float("-inf"), 0.0],
+                [float("nan"), 0.0, float("nan"), 1.0],
+                [float("inf"), 2.0, float("inf"), 3.0],
+                [float("-inf"), -1.0, float("-inf"), 4.0],
             ]
         )
     )
@@ -1435,6 +1458,64 @@ class ElementwiseMaximumIntModule(torch.nn.Module):
 @register_test_case(module_factory=lambda: ElementwiseMaximumIntModule())
 def ElementwiseMaximumIntModule_basic(module, tu: TestUtils):
     module.forward(tu.randint(3, 5, high=10), tu.randint(3, 5, high=10))
+
+
+# ==============================================================================
+
+
+class ElementwiseFmaxModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+            ([-1], torch.float32, True),
+            ([-1], torch.float32, True),
+        ]
+    )
+    def forward(self, x, y):
+        return torch.ops.aten.fmax(x, y)
+
+
+@register_test_case(module_factory=lambda: ElementwiseFmaxModule())
+def ElementwiseFmaxModule_basic(module, tu: TestUtils):
+    module.forward(tu.rand(4), tu.rand(4))
+    module.forward(tu.rand(4), torch.tensor([1.0, torch.nan, -0.5, -0.3]))
+    module.forward(
+        torch.tensor([0.8, torch.nan, torch.nan, -0.3]),
+        torch.tensor([1.0, torch.nan, -0.4, torch.nan]),
+    )
+
+
+# ==============================================================================
+
+
+class ElementwiseFminModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+            ([-1], torch.float32, True),
+            ([-1], torch.float32, True),
+        ]
+    )
+    def forward(self, x, y):
+        return torch.ops.aten.fmin(x, y)
+
+
+@register_test_case(module_factory=lambda: ElementwiseFminModule())
+def ElementwiseFminModule_basic(module, tu: TestUtils):
+    module.forward(tu.rand(4), tu.rand(4))
+    module.forward(tu.rand(4), torch.tensor([1.0, torch.nan, -0.5, -0.3]))
+    module.forward(
+        torch.tensor([0.8, torch.nan, torch.nan, -0.3]),
+        torch.tensor([1.0, torch.nan, -0.4, torch.nan]),
+    )
 
 
 # ==============================================================================
@@ -6223,3 +6304,142 @@ class FakeQuantizePerTensorAffineRoundToEvenModule(torch.nn.Module):
 )
 def FakeQuantizePerTensorAffineRoundToEvenModule_basic(module, tu: TestUtils):
     module.forward(torch.FloatTensor([0.5, 1.5, -0.5, -1.5]))
+
+
+# ==============================================================================
+
+
+class TriuIndicesModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+        ]
+    )
+    def forward(self):
+        return torch.ops.aten.triu_indices(4, 3, 1)
+
+
+@register_test_case(module_factory=lambda: TriuIndicesModule())
+def TriuIndicesModule_basic(module, tu: TestUtils):
+    module.forward()
+
+
+class TriuIndicesAllZerosModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+        ]
+    )
+    def forward(self):
+        return torch.ops.aten.triu_indices(0, 0, 0)
+
+
+@register_test_case(module_factory=lambda: TriuIndicesAllZerosModule())
+def TriuIndicesAllZerosModule_basic(module, tu: TestUtils):
+    module.forward()
+
+
+class TriuIndicesNegativeOffsetModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+        ]
+    )
+    def forward(self):
+        return torch.ops.aten.triu_indices(5, 16, -2)
+
+
+@register_test_case(module_factory=lambda: TriuIndicesNegativeOffsetModule())
+def TriuIndicesNegativeOffsetModule_basic(module, tu: TestUtils):
+    module.forward()
+
+
+# ==============================================================================
+
+
+class TrilIndicesModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+        ]
+    )
+    def forward(self):
+        return torch.ops.aten.tril_indices(4, 3, 1)
+
+
+@register_test_case(module_factory=lambda: TrilIndicesModule())
+def TrilIndicesModule_basic(module, tu: TestUtils):
+    module.forward()
+
+
+class TrilIndicesAllZerosModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+        ]
+    )
+    def forward(self):
+        return torch.ops.aten.tril_indices(0, 0, 0)
+
+
+@register_test_case(module_factory=lambda: TrilIndicesAllZerosModule())
+def TrilIndicesAllZerosModule_basic(module, tu: TestUtils):
+    module.forward()
+
+
+class TrilIndicesNegativeOffsetModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+        ]
+    )
+    def forward(self):
+        return torch.ops.aten.tril_indices(5, 16, -2)
+
+
+@register_test_case(module_factory=lambda: TrilIndicesNegativeOffsetModule())
+def TrilIndicesNegativeOffsetModule_basic(module, tu: TestUtils):
+    module.forward()
+
+
+class TrilIndicesOfssetGreaterThanRowModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+        ]
+    )
+    def forward(self):
+        return torch.ops.aten.tril_indices(7, 9, 8)
+
+
+@register_test_case(module_factory=lambda: TrilIndicesOfssetGreaterThanRowModule())
+def TrilIndicesOfssetGreaterThanRowModule_basic(module, tu: TestUtils):
+    module.forward()

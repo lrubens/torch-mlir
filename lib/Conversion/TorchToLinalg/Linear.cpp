@@ -149,7 +149,8 @@ public:
     TensorType resultType =
         cast<TensorType>(getTypeConverter()->convertType(op.getType()));
     Type elementType = resultType.getElementType();
-    auto accumulatorDType = getDefaultAccType(rewriter, elementType);
+    auto accumulatorDType =
+        getDefaultAccType(rewriter, lhsType.getElementType());
     if (accumulatorDType != resultType.getElementType()) {
       elementType = accumulatorDType;
     }
@@ -185,10 +186,10 @@ public:
                   ValueRange{lhs, rhs, lhsZeroPoint, rhsZeroPoint}, zeroFill)
               .getResult(0);
     } else if (isUnsigned) {
-      matmul = rewriter
-                   .create<linalg::MatmulUnsignedOp>(
-                       loc, zeroFill.getType(), ValueRange{lhs, rhs}, zeroFill)
-                   .getResult(0);
+      auto matmulOp = rewriter.create<linalg::MatmulOp>(
+          loc, zeroFill.getType(), ValueRange{lhs, rhs}, zeroFill);
+      matmulOp.setCast(linalg::TypeFn::cast_unsigned);
+      matmul = matmulOp->getResult(0);
     } else {
       matmul = rewriter
                    .create<linalg::MatmulOp>(loc, zeroFill.getType(),
@@ -787,7 +788,7 @@ public:
     Location loc = op->getLoc();
     MLIRContext *context = op->getContext();
     Value input = adaptor.getInput();   /* in form of N*C*H*W */
-    Value weight = adaptor.getWeight(); /* in form of F*C*H*W */
+    Value weight = adaptor.getWeight(); /* in form of F*C/G*H*W */
     Value bias = adaptor.getBias();
     auto resultTy = cast<ValueTensorType>(op.getType());
 
@@ -803,6 +804,8 @@ public:
       inputZp = typeConverter->materializeTargetConversion(
           rewriter, loc, typeConverter->convertType(inputZp.getType()),
           inputZp);
+      inputZp =
+          rewriter.create<arith::TruncIOp>(loc, rewriter.getI32Type(), inputZp);
       auto torchDtype = cast<ValueTensorType>(make.getType()).getDtype();
       inputUnsigned = torch_to_linalg::isUnsignedTorchType(torchDtype);
     }
@@ -817,6 +820,8 @@ public:
       weightZp = typeConverter->materializeTargetConversion(
           rewriter, loc, typeConverter->convertType(weightZp.getType()),
           weightZp);
+      weightZp = rewriter.create<arith::TruncIOp>(loc, rewriter.getI32Type(),
+                                                  weightZp);
       auto torchDtype = cast<ValueTensorType>(make.getType()).getDtype();
       weightUnsigned = torch_to_linalg::isUnsignedTorchType(torchDtype);
     }
@@ -855,7 +860,7 @@ public:
 
     Type intType = IntegerType::get(context, 64);
     auto castIndexToInt = [&](Value v) {
-      return rewriter.create<arith::IndexCastOp>(loc, intType, v);
+      return rewriter.createOrFold<arith::IndexCastOp>(loc, intType, v);
     };
 
     SmallVector<Value> paddingIntValues;
@@ -893,8 +898,8 @@ public:
       weightDims.push_back(getDimOp(rewriter, loc, weight, i));
 
     // Checks for valid group size
-    int64_t groupSize;
-    if (!matchPattern(op.getGroups(), m_TorchConstantInt(&groupSize)))
+    int64_t numGroups;
+    if (!matchPattern(op.getGroups(), m_TorchConstantInt(&numGroups)))
       return rewriter.notifyMatchFailure(op,
                                          "only constant group size supported.");
     Value groups = castIntToIndex(rewriter, loc, adaptor.getGroups());
@@ -1049,7 +1054,7 @@ public:
             castIndexToInt(weightDims[i]), strideIntValues[i]));
     }
 
-    Type accumulatorDType = getDefaultAccType(rewriter, resultDTy);
+    Type accumulatorDType = getDefaultAccType(rewriter, inputDTy);
     Value initTensor = rewriter.create<tensor::EmptyOp>(
         loc, getAsOpFoldResult(outDims), accumulatorDType);
 
@@ -1113,14 +1118,14 @@ public:
 
     Value conv;
     // the code so far is able to respect all numSpatialDims
-    // the code below this point is numSpatialDims specific and groupSize
+    // the code below this point is numSpatialDims specific and numGroups
     // specific
     // TODO: factor out the above code into a helper function, and then separate
     // convolution into:
     // - grouped 1d-3d
     // - grouped 1d-3d (quantized)
     // - ungrouped 1d-3d
-    if (groupSize == 1 && !inputZp) {
+    if (numGroups == 1 && !inputZp) {
       switch (numSpatialDims) {
       case 1:
         conv = rewriter
@@ -1161,7 +1166,7 @@ public:
       return success();
     }
 
-    if (groupSize == 1 && inputZp) {
+    if (numGroups == 1 && inputZp) {
       // The quantized version uses a different channel ordering so we need to
       // permute the tensors in order to use the existing path. We should
       // eventually directly support this channel ordering.
@@ -1225,30 +1230,66 @@ public:
       return rewriter.notifyMatchFailure(
           op, "unimplemented: only 2D grouped convolution supported");
 
-    // Special depthwise case
+    // Special depthwise case: Cin = Cout = groups.
+    // Note: pytorch considers Cin == groups (Cout possibly a non-zero multiple
+    // of groups) to be depthwise in their documentation, but the linalg ops
+    // apparently disagree.
     auto inShape = makeShapeTorchCompatible(
         cast<RankedTensorType>(input.getType()).getShape());
     auto weightShape = makeShapeTorchCompatible(
         cast<RankedTensorType>(weight.getType()).getShape());
-    if (weightShape[0] != kUnknownSize && inShape[1] == groupSize &&
-        weightShape[0] % inShape[1] == 0 && weightShape[1] == 1 && !inputZp) {
-      // Collapse weight shape
+    if (inShape[1] == numGroups && weightShape[0] == numGroups &&
+        weightShape[1] == 1) {
+      // Collapse weight shape (C/G == 1)
       SmallVector<ReassociationIndices, 4> collapsedDims = {{0, 1}, {2}, {3}};
-      SmallVector<int64_t> collapsedShape{
-          (weightShape[0] == kUnknownSize ? kUnknownSize
-                                          : weightShape[0] * weightShape[1]),
-          weightShape[2], weightShape[3]};
+      SmallVector<int64_t> collapsedShape{weightShape[0] * weightShape[1],
+                                          weightShape[2], weightShape[3]};
       Type collapsedType = RankedTensorType::get(
           makeShapeLLVMCompatible(collapsedShape), weightDTy);
       Value collapsedWeight = rewriter.create<tensor::CollapseShapeOp>(
           loc, collapsedType, weight, collapsedDims);
+      if (!inputZp) {
+        conv = rewriter
+                   .create<linalg::DepthwiseConv2DNchwChwOp>(
+                       loc, outputTensor.getType(),
+                       ValueRange{paddedInput, collapsedWeight}, outputTensor,
+                       stridesAttr, dilationAttr)
+                   .getResult(0);
+      } else {
+        // currently, the only named depthwise qconv op is nhwc_hwc
+        // input: nchw -> nhwc; weight (collapsed): chw -> hwc
+        // linalg conv result nhwc -> nchw
+        // inPerms = [0, 2, 3, 1]
+        // weightPerms = [1, 2, 0]
+        // resultPerms = [0, 3, 1, 2]
+        llvm::SmallVector<int64_t> inPerms, weightPerms, resultPerms;
+        inPerms.push_back(0);
+        resultPerms.append({0, static_cast<int64_t>(numSpatialDims + 1)});
+        for (size_t i = 0; i < numSpatialDims; ++i) {
+          inPerms.push_back(i + 2);
+          weightPerms.push_back(i + 1);
+          resultPerms.push_back(i + 1);
+        }
+        inPerms.push_back(1);
+        weightPerms.push_back(0);
 
-      conv = rewriter
-                 .create<linalg::DepthwiseConv2DNchwChwOp>(
-                     loc, outputTensor.getType(),
-                     ValueRange{paddedInput, collapsedWeight}, outputTensor,
-                     stridesAttr, dilationAttr)
-                 .getResult(0);
+        paddedInput =
+            transposeValue(op.getLoc(), paddedInput, inPerms, rewriter);
+        collapsedWeight =
+            transposeValue(op.getLoc(), collapsedWeight, weightPerms, rewriter);
+        outputTensor =
+            transposeValue(op.getLoc(), outputTensor, inPerms, rewriter);
+
+        conv =
+            rewriter
+                .create<linalg::DepthwiseConv2DNhwcHwcQOp>(
+                    loc, outputTensor.getType(),
+                    ValueRange{paddedInput, collapsedWeight, inputZp, weightZp},
+                    outputTensor, stridesAttr, dilationAttr)
+                .getResult(0);
+        // convert output nhwc -> nchw
+        conv = transposeValue(op.getLoc(), conv, resultPerms, rewriter);
+      }
 
       Type newResultType = getTypeConverter()->convertType(op.getType());
       if (accumulatorDType != resultDTy) {
@@ -1269,12 +1310,12 @@ public:
       SmallVector<int64_t> outShape;
       for (auto i = 0; i < (long)inShape.size(); i++) {
         if (i == 1) {
-          outShape.push_back(groupSize);
+          outShape.push_back(numGroups);
         }
         if (i == (long)dim) {
           outShape.push_back(inShape[i] == kUnknownSize
                                  ? kUnknownSize
-                                 : inShape[i] / groupSize);
+                                 : inShape[i] / numGroups);
         } else {
           outShape.push_back(inShape[i]);
         }
@@ -1300,8 +1341,8 @@ public:
       auto inShape = makeShapeTorchCompatible(inType.getShape());
 
       SmallVector<int64_t> outShape{
-          groupSize,
-          (inShape[0] == kUnknownSize ? kUnknownSize : inShape[0] / groupSize)};
+          numGroups,
+          (inShape[0] == kUnknownSize ? kUnknownSize : inShape[0] / numGroups)};
       outShape.append(inShape.begin() + 1, inShape.end());
 
       SmallVector<ReassociationIndices> indices{{0, 1}};
